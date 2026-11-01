@@ -128,6 +128,7 @@ _FROZEN_ENGINE_FIELDS_MUST_BE_OFF = (
     "offload_kv_for_weight_sync",
 )
 _FROZEN_ENGINE_FIELDS_MUST_BE_NONE = (
+    "dynamo",
     "speculative_config",
     "fp8_weight_sync_mode",
     "external_server_urls",

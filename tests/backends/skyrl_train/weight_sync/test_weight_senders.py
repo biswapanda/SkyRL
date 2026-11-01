@@ -348,6 +348,16 @@ class TestBuildTrainerEngineResolvesTheBackend:
         seen = self._build(monkeypatch, "nccl", False)
         assert seen["factory_args"][0] is torch.bfloat16
 
+    def test_provider_spec_builds_independent_sender_client(self, monkeypatch):
+        from unittest.mock import Mock
+
+        sentinel = SimpleNamespace()
+        spec = SimpleNamespace(fail_closed_transfers=False, build_client=Mock(return_value=sentinel))
+        seen = self._build(monkeypatch, "ipc", False, control_spec=spec)
+        spec.build_client.assert_called_once_with(None)
+        assert seen["client"] is sentinel
+        assert seen["init_info"].backend == "skyrl_ipc"
+
     def test_direct_sender_keeps_existing_client(self, monkeypatch):
         from skyrl.backends.skyrl_train.weight_sync.control_plane import (
             SkyrlWeightSyncClient,

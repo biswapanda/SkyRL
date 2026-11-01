@@ -79,8 +79,8 @@ side to declare the capability attributes above and run the draft session -- and
 
 ## Transfer backends
 
-- **Broadcast** (`nccl`): NCCL collective, packed. Used for **non-colocated** setups. Training and inference are on different GPUs; weights cross the wire over a dedicated process group.
-- **CUDA IPC** (`ipc`): packed IPC handles out of one reusable buffer. Used for **colocated** setups (`colocate_all=true`). Both sides live on the same GPU; the receiver maps the sender's CUDA allocation directly and clones out of it.
+- **Broadcast** (`nccl`): NCCL collective, packed. Configured `nccl` selects broadcast for non-colocated setups and CUDA IPC for native colocated setups; broadcast sends weights over a dedicated process group.
+- **CUDA IPC** (`ipc`): packed IPC handles out of one reusable buffer. Native colocated setups (`colocate_all=true`) select it through configured `nccl`. Explicit `weight_sync_backend=ipc` is restricted to the external Dynamo profile, which validates matching physical GPU UUIDs despite non-colocated placement. Both sides must live on the same physical GPU; the receiver maps the sender's CUDA allocation directly and clones out of it.
 - **Delta** (`delta`): Weights travel as compressed XOR deltas against the base checkpoint, through a shared filesystem or object store instead of the network fabric. Selected with `generator.inference_engine.weight_sync_backend=delta`; intended for **non-colocated** setups where the two sides are not NCCL-reachable (separate clusters, PD-disaggregated serving). Not supported with LoRA (`validate_cfg` rejects it).
 - **Sharded RDT** (`sharded_rdt`): the inference workers **pull** the slices they consume from
   the trainer ranks over NIXL/RDMA, instead of the trainer pushing every tensor to every
@@ -89,12 +89,7 @@ side to declare the capability attributes above and run the draft session -- and
   `distributed_executor_backend=ray` because the workers dial named trainer actors. See
   the dedicated section below.
 
-Selection is `get_transfer_strategy(weight_sync_backend, colocate_all)`, called from two
-places that must agree: `inference_servers/utils.build_vllm_cli_args` on the driver (via
-`get_vllm_receive_backend`, to build the servers' `WeightTransferConfig`, and to force
-`distributed_executor_backend=ray` for `sharded_rdt`), and `build_trainer_engine` on each
-worker. Both read the same two config values, so the trainer and receive engines cannot
-disagree.
+Native deployments resolve transport with `get_transfer_strategy(weight_sync_backend, colocate_all)` in two places that must agree: `inference_servers/utils.build_vllm_cli_args` on the driver (via `get_vllm_receive_backend`, to build the servers' `WeightTransferConfig`, and to force `distributed_executor_backend=ray` for `sharded_rdt`), and `build_trainer_engine` on each worker. Both read the same two config values, so the trainer and receive engines cannot disagree. Explicit `ipc` selects CUDA IPC regardless of placement, but canonical config validation restricts it to the external Dynamo profile, whose initialization verifies matching physical GPU UUIDs; it is not a direct-vLLM placement option. Unknown backend names raise `ValueError` instead of falling back to NCCL.
 
 ### Weight sources
 
@@ -165,6 +160,10 @@ worker-side init dict:
 
 ### Capability declarations
 
+External serving providers extend `RemoteInferenceClient.weight_sync_control_spec(device_uuid)` to validate the trainer and return a picklable `WeightSyncControlSpec`. The spec carries the transfer-failure capability and builds the independent blocking control client; shared workers and sender factories do not import provider implementations. Provider configuration and untrusted discovery metadata are validated at their owning boundaries, not revalidated by the trainer factory. The direct default builds `SkyrlWeightSyncClient` with the existing per-server init rewrites.
+
+Providers declare `owns_weight_update_lifecycle=True` when their `weight_update_transaction()` owns the complete update bracket, including cache invalidation, instead of native placement, sleep and pause scheduling. Direct vLLM keeps this capability false, preserving all existing scheduling modes and the trainer-engine cache-reset capability below. Blocking clients declare `fail_closed_transfers=True` only when uncertain IPC acknowledgments require retaining exported buffers until receiver fencing. `ipc_lifetime.FAILED_IPC_PRODUCERS` intentionally retains those producers for the process lifetime; an external supervisor must fence receiver processes before terminating the producer. The lifetime override's private vLLM signatures, producer arguments and per-chunk loop are pinned by `test_ipc_private_contract.py` and must be reviewed on vLLM upgrades.
+
 Three things the trainer engine cannot do for itself are read off the engine as plain
 attributes in `Worker._sync_weights_to_inference_engines`. `weight_senders.SkyrlTrainerCapabilities`
 declares them with the common-case defaults, and every trainer engine inherits it:
@@ -172,7 +171,7 @@ declares them with the common-case defaults, and every trainer engine inherits i
 | attribute | default | who overrides it |
 |---|---|---|
 | `skyrl_handles_prefix_cache_reset` | False | delta (it resets inside its own pause bracket) |
-| `skyrl_force_disable_expandable_segments` | False | sharded_rdt (CUDA-IPC shares on every run, not only under colocation) |
+| `skyrl_force_disable_expandable_segments` | False | sharded_rdt and skyrl_ipc (both CUDA-IPC share on every run, not only under colocation) |
 | `skyrl_empty_cache_after_send` | True | sharded_rdt sets False (buffers are reused next step) |
 
 vLLM's own NCCL and IPC trainer engines cannot carry SkyRL attributes, so SkyRL subclasses
@@ -545,7 +544,7 @@ serialized FP8 and adapter-only LoRA.
 
 ## KV offload during non-colocated weight sync
 
-Non-colocated normally keeps the engine fully awake and does `pause_generation → broadcast → resume_generation`. The opt-in `generator.inference_engine.offload_kv_for_weight_sync` flag sleeps the engine (freeing the KV cache from GPU) *during* the sync so `gpu_memory_utilization` can be pushed higher (no need to keep KV cache resident alongside the weight-transfer scratch buffers). It turns on `enable_sleep_mode` (via `inference_servers/utils.py`). Requires non-colocated and non-LoRA. Orchestrated in `WorkerDispatch.save_weights_for_sampler`; the flow depends on the trainer:
+Native non-colocated vLLM normally keeps the engine fully awake and does `pause_generation → broadcast → resume_generation`. The opt-in `generator.inference_engine.offload_kv_for_weight_sync` flag sleeps the engine (freeing the KV cache from GPU) *during* the sync so `gpu_memory_utilization` can be pushed higher (no need to keep KV cache resident alongside the weight-transfer scratch buffers). It turns on `enable_sleep_mode` (via `inference_servers/utils.py`). Requires non-colocated and non-LoRA. Orchestrated in `WorkerDispatch.save_weights_for_sampler`; the flow depends on the trainer:
 
 - **Synchronous trainer** (`fully_async.enabled=false`): generation is complete at sync time, so there are no in-flight requests. A plain `sleep() → wake_up(["weights"]) → broadcast → wake_up(["kv_cache"])` (the same three-phase pattern colocated uses) is enough — the standard `/sleep`+`/wake_up` endpoints discard the KV cache and free the memory.
 - **Fully-async trainer** (`fully_async.enabled=true`): generation overlaps the sync, so `pause_generation` (KEEP) freezes in-flight requests, then the allocator is driven directly (see below) so the scheduler is **not** resumed on the weights wake. The KV cache is offloaded to CPU and restored so frozen requests resume with no abort or prefill recompute — **unless** `clear_kv_cache_on_weight_sync=true`, in which case the broadcast resets the prefix cache anyway, so the KV is discarded (skipping the CPU copy) rather than offloaded.

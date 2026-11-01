@@ -7,7 +7,7 @@ it to a ``TrainerWeightTransferEngine`` (``weight_senders.py``) whose
 
 ===============  ==========================================================
 ``nccl``         broadcast from trainer rank 0; non-colocated
-``ipc``          CUDA IPC handles; colocated (``placement.colocate_all``)
+``ipc``          CUDA IPC handles; colocated or qualified external Dynamo
 ``delta``        compressed checkpoint deltas via disk / ``gs://`` / ``s3://``
 ``sharded_rdt``  the inference workers pull slices over NIXL
 ===============  ==========================================================
@@ -37,16 +37,22 @@ _VLLM_RECEIVE_BACKENDS = {
 def get_transfer_strategy(weight_sync_backend: str, colocate_all: bool) -> str:
     """Resolve the logical weight-sync backend from config + placement.
 
-    A configured ``nccl`` means CUDA IPC when training and inference share GPUs,
-    and broadcast otherwise.
+    A configured ``nccl`` means CUDA IPC under ``colocate_all`` and NCCL broadcast
+    otherwise. Explicit ``ipc`` selects CUDA IPC regardless of placement; config
+    validation restricts it to the external Dynamo profile, whose initialization
+    verifies matching physical GPU UUIDs. Unknown backend names raise ``ValueError``.
     """
     if weight_sync_backend in ("sharded_rdt", "rdt"):
         return "sharded_rdt"
     if weight_sync_backend == "delta":
         return "delta"
+    if weight_sync_backend == "ipc":
+        return "ipc"
     if weight_sync_backend == "nccl" and colocate_all:
         return "ipc"
-    return "nccl"
+    if weight_sync_backend == "nccl":
+        return "nccl"
+    raise ValueError(f"Unsupported weight sync backend: {weight_sync_backend!r}")
 
 
 def get_vllm_receive_backend(weight_sync_backend: str, colocate_all: bool) -> str:

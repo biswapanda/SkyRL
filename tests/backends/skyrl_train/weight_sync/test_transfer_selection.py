@@ -13,6 +13,8 @@ from skyrl.backends.skyrl_train.weight_sync import (
     [
         ("nccl", False, "nccl", "skyrl_nccl"),
         ("nccl", True, "ipc", "skyrl_ipc"),
+        ("ipc", False, "ipc", "skyrl_ipc"),
+        ("ipc", True, "ipc", "skyrl_ipc"),
         ("delta", False, "delta", "delta"),
         ("delta", True, "delta", "delta"),
         ("sharded_rdt", False, "sharded_rdt", "sharded_rdt"),
@@ -30,3 +32,9 @@ def test_backend_selection_matches_the_native_trainer_and_receiver(
 
     assert get_transfer_strategy(configured_backend, colocate_all) == logical_backend
     assert get_vllm_receive_backend(configured_backend, colocate_all) == receive_backend
+
+
+@pytest.mark.parametrize("backend", ["", "bogus", "IPC", None])
+def test_unknown_backend_is_rejected(backend):
+    with pytest.raises(ValueError, match="Unsupported weight sync backend"):
+        get_transfer_strategy(backend, False)

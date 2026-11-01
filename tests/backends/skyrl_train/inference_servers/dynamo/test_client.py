@@ -644,3 +644,92 @@ async def test_real_membership_check_rejects_capability_changes(monkeypatch):
     monkeypatch.setattr(client_module, "discover_worker_snapshot", lambda *args: changed)
     with pytest.raises(RuntimeError, match="membership or capabilities changed"):
         await client._check_membership()
+
+
+@pytest.mark.asyncio
+async def test_model_override_cannot_route_outside_frozen_policy(monkeypatch):
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        RemoteInferenceClient,
+    )
+
+    client = make_client(monkeypatch)
+    client._admission_open = True
+    generate = AsyncMock(return_value={"response_ids": [[2]]})
+    monkeypatch.setattr(RemoteInferenceClient, "generate", generate)
+    with pytest.raises(ValueError, match="frozen policy model"):
+        await client.generate({"prompt_token_ids": [[1]]}, model="another-policy")
+    generate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["before", "after", "epoch", None])
+async def test_generation_checks_membership_before_and_after_with_epoch_fence(monkeypatch, failure):
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        RemoteInferenceClient,
+    )
+
+    client = make_client(monkeypatch)
+    client._admission_open = True
+    if failure == "before":
+        client._check_membership.side_effect = RuntimeError("changed before")
+    elif failure == "after":
+        client._check_membership.side_effect = [None, RuntimeError("changed after")]
+
+    async def generate(*args, **kwargs):
+        if failure == "epoch":
+            client._weight_version += 1
+        return {"response_ids": [[2]]}
+
+    generate_mock = AsyncMock(side_effect=generate)
+    monkeypatch.setattr(RemoteInferenceClient, "generate", generate_mock)
+    if failure is not None:
+        with pytest.raises(RuntimeError):
+            await client.generate({"prompt_token_ids": [[1]]})
+        assert not client.admission_open
+    else:
+        assert await client.generate({"prompt_token_ids": [[1]]}) == {"response_ids": [[2]]}
+        assert client.admission_open
+    assert client._active_attempts == 0
+    if failure == "before":
+        generate_mock.assert_not_awaited()
+    else:
+        client._check_membership.assert_awaited()
+        assert client._check_membership.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_driver_requests_share_checks_and_hold_update_fence(monkeypatch):
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        RemoteInferenceClient,
+    )
+
+    client = make_client(monkeypatch)
+    client._admission_open = True
+    started, release_request, checking_after, release_check = (asyncio.Event() for _ in range(4))
+    count = 0
+
+    async def check():
+        if client._check_membership.await_count == 2:
+            checking_after.set()
+            await release_check.wait()
+
+    async def request(*args, **kwargs):
+        nonlocal count
+        count += 1
+        if count == 16:
+            started.set()
+        await release_request.wait()
+        return {"response_ids": [[2]]}
+
+    client._check_membership.side_effect = check
+    monkeypatch.setattr(RemoteInferenceClient, "generate", request)
+    tasks = [asyncio.create_task(client.generate({"prompt_token_ids": [[1]]})) for _ in range(16)]
+    await started.wait()
+    release_request.set()
+    await checking_after.wait()
+    assert client._active_attempts == 16
+    assert not any(task.done() for task in tasks)
+    release_check.set()
+    assert await asyncio.gather(*tasks) == [{"response_ids": [[2]]}] * 16
+    assert client._check_membership.await_count == 2
+    assert client._active_attempts == 0

@@ -38,8 +38,9 @@ examples/train/         # Example training scripts per model/backend
 ## Weight Sync
 
 Training weights are synced to inference engines via:
-- **Broadcast strategy**: NCCL-based, for non-colocated setups.
-- **CUDA IPC strategy**: For colocated setups (`colocate_all=true`).
+
+- **Broadcast strategy**: Configured `weight_sync_backend=nccl` selects NCCL broadcast for non-colocated setups and CUDA IPC for native colocated setups.
+- **CUDA IPC strategy**: Native colocated setups (`colocate_all=true`) select IPC through configured `nccl`. Explicit `weight_sync_backend=ipc` is restricted to the external Dynamo profile, which validates matching physical GPU UUIDs despite non-colocated placement; both sides must share the same physical GPU.
 - **Delta strategy**: Checkpoint deltas through a shared directory or object store, for
   non-colocated setups where the two sides are not NCCL-reachable. See
   `.agents/docs/weight_sync.md`.
