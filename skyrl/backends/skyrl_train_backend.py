@@ -20,6 +20,9 @@ from skyrl.backends.renderer import (
     VLLMRenderer,
     render_model_input,
 )
+from skyrl.backends.skyrl_train.inference_servers.dynamo.launch import (
+    validate_dynamo_config,
+)
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
 from skyrl.backends.skyrl_train.training_batch import (
     TensorList,
@@ -151,6 +154,9 @@ def _build_skyrl_train_config(
         user_overrides["trainer.policy.model.lora.train_attn"] = lora_config.train_attn
         user_overrides["trainer.policy.model.lora.train_mlp"] = lora_config.train_mlp
     cfg = SkyRLTrainConfig.from_cli_overrides(user_overrides)
+    if cfg.generator.inference_engine.dynamo is not None:
+        raise ValueError("Dynamo inference is unsupported by Tinker because sampling bypasses the policy cohort")
+    validate_dynamo_config(cfg)
     lora = cfg.trainer.policy.model.lora
     if lora.rank > 0:
         # Fail before Ray starts or any GPU is reserved. The worker repeats this and adds the
