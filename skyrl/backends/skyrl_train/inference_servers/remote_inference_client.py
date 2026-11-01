@@ -50,11 +50,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     ClassVar,
     Dict,
     Iterable,
@@ -274,10 +277,27 @@ class RemoteGenerateClient:
     """Reusable HTTP client for one raw-token generation request."""
 
     proxy_url: str
+    retries: int = _DATA_PLANE_RETRIES - 1
+    """Additional attempts after the initial request; zero disables replay."""
+    request_timeout_s: Optional[float] = None
+    """Per-request deadline in seconds; None preserves unbounded generation."""
+    response_validator: Optional[Callable[[Any], None]] = field(default=None, repr=False)
+    allow_redirects: bool = True
+    """Preserve native redirects by default; strict providers disable them."""
     # aiohttp.ClientSession is bound to the event loop that created it, so one session is kept per loop.
     _sessions: Dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = field(
         default_factory=dict, init=False, repr=False
     )
+
+    def __post_init__(self) -> None:
+        if type(self.retries) is not int or self.retries < 0:
+            raise ValueError("Generation retries must be a nonnegative integer")
+        if self.request_timeout_s is not None and (
+            isinstance(self.request_timeout_s, bool)
+            or not math.isfinite(self.request_timeout_s)
+            or self.request_timeout_s <= 0
+        ):
+            raise ValueError("Generation timeout must be finite and positive")
 
     def _drop_closed_loop_sessions(self) -> None:
         """Forget sessions whose event loop has been closed.
@@ -307,7 +327,9 @@ class RemoteGenerateClient:
                 limit=SKYRL_HTTP_CONNECTION_LIMIT,
                 keepalive_timeout=2,
             )
-            session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None))
+            session = aiohttp.ClientSession(
+                connector=connector, timeout=aiohttp.ClientTimeout(total=None), trust_env=False
+            )
             self._sessions[current_loop] = session
         return session
 
@@ -322,9 +344,18 @@ class RemoteGenerateClient:
         """POST JSON with retries, optionally splicing packed arrays before parsing."""
         session = await self._get_session()
         last_exc: Optional[Exception] = None
-        for attempt in range(_DATA_PLANE_RETRIES):
+        attempts = self.retries + 1
+        for attempt in range(attempts):
             try:
-                async with session.post(url, json=json, headers=headers) as resp:
+                async with session.post(
+                    url,
+                    json=json,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.request_timeout_s),
+                    allow_redirects=self.allow_redirects,
+                ) as resp:
+                    if not self.allow_redirects and 300 <= resp.status < 400:
+                        raise InferenceServerHTTPError.from_response(resp, resp.reason)
                     try:
                         raw = await resp.read()
                         body = load_packed_body(raw) if packed_side_channels else orjson.loads(raw)
@@ -332,7 +363,6 @@ class RemoteGenerateClient:
                         if 400 <= resp.status < 500:
                             text = await resp.text()
                             raise InferenceServerHTTPError.from_response(resp, text or resp.reason) from exc
-                        last_exc = exc
                         # The bare JSONDecodeError says only "line 1 column 1 (char 0)", which
                         # gives no hint whether the body was empty, an HTML error page, or a
                         # plain-text 5xx. Capture the status and a snippet so a failure here is
@@ -342,19 +372,28 @@ class RemoteGenerateClient:
                             text = await resp.text()
                         except Exception:  # noqa: BLE001 - body may be unreadable
                             text = "<unreadable>"
+                        last_exc = (
+                            InferenceServerHTTPError.from_response(resp, text or resp.reason)
+                            if resp.status >= 400
+                            else exc
+                        )
                         logger.warning(
                             f"non-JSON response from {url} on attempt "
-                            f"{attempt + 1}/{_DATA_PLANE_RETRIES}: status={resp.status} "
+                            f"{attempt + 1}/{attempts}: status={resp.status} "
                             f"len={len(text)} body={text[:500]!r}"
                         )
-                        await asyncio.sleep(1)
+                        if attempt < self.retries:
+                            await asyncio.sleep(1)
                         continue
                     raise_for_status(resp, body)
+                    if self.response_validator is not None:
+                        self.response_validator(body)
                     return body
             except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as exc:
                 last_exc = exc
-                logger.debug(f"POST retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {exc}")
-                await asyncio.sleep(1)
+                logger.debug(f"POST retry {attempt + 1}/{attempts} for {url=}: {exc}")
+                if attempt < self.retries:
+                    await asyncio.sleep(1)
         if last_exc is None:
             raise RuntimeError(f"POST failed without an exception for {url=}")
         raise last_exc
@@ -410,7 +449,7 @@ class RemoteGenerateClient:
         if cache_salt is not None:
             payload["cache_salt"] = cache_salt
 
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "X-Request-ID": uuid.uuid4().hex}
         if session_id:
             headers["X-Session-ID"] = str(session_id)
 

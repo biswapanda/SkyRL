@@ -1295,6 +1295,30 @@ SUPPORTED_SPECULATIVE_DECODING_METHODS = ("mtp",)
 
 
 @dataclass
+class DynamoInferenceConfig(BaseConfig):
+    """Discovery and deadlines for an externally managed, fixed Dynamo RL fleet."""
+
+    discovery_url: str = "http://127.0.0.1:8001"
+    """Base URL of the Dynamo protocol-v1 RL worker discovery service."""
+    namespace: str = ""
+    """Exact, dedicated Dynamo namespace for this training run; required when enabled."""
+    expected_workers: int = 1
+    """Required number of fixed, aggregated serving workers."""
+    allowed_hosts: List[str] = field(default_factory=lambda: ["127.0.0.1", "localhost", "::1"])
+    """Allowed discovery and worker administration destination hosts; IPC requires loopback."""
+    auth_token_env: str = "DYN_SYSTEM_ENGINE_AUTH_TOKEN"
+    """Environment variable containing the engine bearer token; never store its value in config.
+
+    Choose a dedicated name outside ``SKYRL_*`` and the runtime environment's forwarded or logged names, including ``HF_TOKEN`` and ``NCCL_DEBUG``. The owned local raylet inherits this secret from its parent; it is never serialized in Ray's runtime environment."""
+    discovery_timeout_s: float = 5.0
+    """Deadline in seconds for each discovery read; failed reads are not retried."""
+    control_timeout_s: float = 300.0
+    """Deadline in seconds for each worker administration call."""
+    request_timeout_s: float = 600.0
+    """Deadline in seconds for each rollout request."""
+
+
+@dataclass
 class InferenceEngineConfig(BaseConfig):
     """Configuration for inference engine instantiation and management."""
 
@@ -1327,16 +1351,18 @@ class InferenceEngineConfig(BaseConfig):
     """Number of inference engines to launch when ``run_engines_locally=True``."""
     backend: str = "vllm"
     """``"vllm"``."""
+    dynamo: Optional[DynamoInferenceConfig] = None
+    """Select the external Dynamo RL integration when set; direct vLLM remains the default."""
     weight_sync_backend: str = "nccl"
     """Backend used for weight synchronization.
-    Use ``"nccl"`` (colocated ``nccl`` uses CUDA IPC internally), or ``"delta"`` for checkpoint-delta sync through
-    shared storage in non-colocated vLLM runs. See https://docs.skyrl.ai/docs/examples/delta_weight_sync"""
+
+    Use ``"nccl"`` (colocated ``nccl`` uses CUDA IPC internally), ``"delta"`` for checkpoint-delta sync through shared storage in non-colocated vLLM runs, or ``"sharded_rdt"`` for NIXL pull-based sync. Explicit ``"ipc"`` is restricted to the external Dynamo integration, which validates physical-device identity; it is not a direct-vLLM placement option. Unknown backend names raise ``ValueError`` instead of falling back to NCCL. See https://docs.skyrl.ai/docs/examples/delta_weight_sync"""
     weight_transfer_threshold_cuda_ipc_GB: float = 1.0
     """Size (GB) of the reusable packed buffer the trainer streams weights through.
 
-    Applies to both push backends -- ``nccl`` and colocated ``ipc``. Raised to fit the
-    model's largest single parameter when that exceeds it, since a tensor too large for
-    the buffer cannot be packed at all."""
+    Applies to both push backends -- ``nccl`` and ``ipc``, including explicit IPC for
+    the external Dynamo profile. Raised to fit the model's largest single parameter
+    when that exceeds it, since a tensor too large for the buffer cannot be packed at all."""
     delta_weight_sync: Optional[DeltaWeightSyncConfig] = None
     """Required when ``weight_sync_backend="delta"``."""
     tensor_parallel_size: int = 1
@@ -1588,8 +1614,8 @@ class TrainerConfig(BaseConfig):
 
     Reduces GPU memory fragmentation across the offload/backload and forward/backward cycles.
     Automatically turned off around CUDA-IPC weight sync, since IPC handles are incompatible with the
-    VMM addresses expandable segments uses; under ``colocate_all=False`` weight sync uses NCCL
-    broadcast instead, so it stays on continuously.
+    VMM addresses expandable segments use. Sharded RDT and explicit ``ipc`` for the external Dynamo
+    profile also disable it around sends under non-colocated placement; NCCL broadcast is unaffected.
     ``InferenceEngineConfig.use_expandable_segments`` is the independent inference-engine knob (the
     trainer and the engine are separate processes with separate allocators). See
     https://docs.skyrl.ai/docs/troubleshooting/troubleshooting for the fragmentation symptoms this
