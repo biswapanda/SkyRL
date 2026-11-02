@@ -153,3 +153,26 @@ def test_failure_before_export_latches_without_a_quarantined_producer(monkeypatc
     assert len(ipc_lifetime.FAILED_IPC_PRODUCERS) == 0
     with pytest.raises(RuntimeError, match="restart"):
         engine.send_weights()
+
+
+@pytest.mark.parametrize("already_fenced", [True, False])
+def test_gpu_qualification_cleanup_preserves_producer_until_owned_fence(monkeypatch, tmp_path, already_fenced):
+    from tests.backends.skyrl_train.gpu.gpu_ci.inference_servers import (
+        test_dynamo_weight_sync as qualification,
+    )
+
+    sleeps = []
+    if already_fenced:
+        (tmp_path / "fenced").touch()
+
+    def acknowledge_only_after_two_waits(_seconds):
+        sleeps.append(True)
+        if len(sleeps) == 2:
+            (tmp_path / "fenced").touch()
+
+    monkeypatch.setattr(qualification.time, "sleep", acknowledge_only_after_two_waits)
+    qualification._preserve_until_receiver_fence(tmp_path, timeout_s=0)
+    assert (tmp_path / "fence-request").exists()
+    assert (tmp_path / "fenced").exists()
+    assert len(sleeps) == (0 if already_fenced else 2)
+    assert (tmp_path / "fence-timeout").exists() is not already_fenced
