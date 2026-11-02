@@ -29,6 +29,11 @@ from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
     resolve_auto_wire_format,
     validate_concrete_fp8_recipe,
 )
+from skyrl.backends.skyrl_train.inference_servers.dynamo.launch import (
+    owned_ray_launch,
+    validate_dynamo_config,
+    validate_dynamo_environment,
+)
 from skyrl.backends.skyrl_train.utils.io.io import is_cloud_path
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     AUTO_FP8,
@@ -710,6 +715,8 @@ def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
     """
     ie_cfg = cfg.generator.inference_engine
 
+    validate_dynamo_config(cfg)
+
     # "auto" resolves from the trainer recipe in validate_megatron_cfg; a
     # config path that never runs it (the serve entrypoint, non-megatron
     # strategies) has no recipe to resolve from, so reject it with the way out
@@ -1002,6 +1009,8 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
     """
     # TODO(sumanthrh): introduce a debug mode and add debugging flags like `CUDA_LAUNCH_BLOCKING` here
     env_vars = {}
+    environment_policy = validate_dynamo_environment(cfg)
+
     annotation_cfg = cfg.trainer.grafana_annotations
     if annotation_cfg.enabled and (token := os.environ.get(annotation_cfg.token_env_var)):
         env_vars[annotation_cfg.token_env_var] = token
@@ -1060,10 +1069,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         # overrides for `VLLM_DISABLE_COMPILE_CACHE`
         # TODO (sumanthrh): Test with shared storage in a multi-node env where we can persist cache
         if os.environ.get("VLLM_DISABLE_COMPILE_CACHE"):
-            logger.info(
-                "Exporting `VLLM_DISABLE_COMPILE_CACHE` to ray runtime env: "
-                f"{os.environ['VLLM_DISABLE_COMPILE_CACHE']}"
-            )
+            logger.info("Exporting `VLLM_DISABLE_COMPILE_CACHE` to ray runtime env")
             env_vars["VLLM_DISABLE_COMPILE_CACHE"] = os.environ["VLLM_DISABLE_COMPILE_CACHE"]
 
         if not os.environ.get("VLLM_USE_V1", False):
@@ -1074,15 +1080,11 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
         if os.environ.get("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"):
-            logger.info(
-                f"Exporting `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` to ray runtime env: {os.environ['VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS']}"
-            )
+            logger.info("Exporting `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` to ray runtime env")
             env_vars["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] = os.environ["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"]
 
         if os.environ.get("RAY_CGRAPH_get_timeout"):
-            logger.info(
-                f"Exporting `RAY_CGRAPH_get_timeout` to ray runtime env: {os.environ['RAY_CGRAPH_get_timeout']}"
-            )
+            logger.info("Exporting `RAY_CGRAPH_get_timeout` to ray runtime env")
             env_vars["RAY_CGRAPH_get_timeout"] = os.environ["RAY_CGRAPH_get_timeout"]
 
     # Use max of available GPU counts, defaulting to 1 if none found
@@ -1105,7 +1107,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         env_vars["NCCL_SHM_DISABLE"] = "1"
 
     if os.environ.get("NCCL_NET_PLUGIN"):
-        logger.info(f"Exporting NCCL_NET_PLUGIN to ray runtime env: {os.environ['NCCL_NET_PLUGIN']}")
+        logger.info("Exporting NCCL_NET_PLUGIN to ray runtime env")
         env_vars["NCCL_NET_PLUGIN"] = os.environ["NCCL_NET_PLUGIN"]
 
     # TODO: this can be removed if we standardize on env files.
@@ -1131,14 +1133,14 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
     if SKYRL_LD_LIBRARY_PATH_EXPORT:
         # export `LD_LIBRARY_PATH` to ray runtime env.
         # For some reason the `LD_LIBRARY_PATH` is not exported to the worker with .env file.
-        logger.info(f"Exporting `LD_LIBRARY_PATH` to ray runtime env: {os.environ['LD_LIBRARY_PATH']}")
+        logger.info("Exporting `LD_LIBRARY_PATH` to ray runtime env")
         env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
 
     if SKYRL_PYTHONPATH_EXPORT:
         # allow pythonpath to be updated as a fall back for deps that are not shipped with UV
         # not recommended since it can cause unexpected conflicts with UV packages,
         # but keeping for backwards compatibility
-        logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
+        logger.info("Exporting `PYTHONPATH` to ray runtime env")
         env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
 
     # Forward uv's project-environment selection to the workers. Ray's uv runtime-env hook makes each
@@ -1177,8 +1179,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "NCCL_DEBUG",
     ):
         if value := os.environ.get(var_name):
-            logged_value = "[REDACTED]" if var_name == "HF_TOKEN" else value
-            logger.info(f"Exporting `{var_name}` to ray runtime env: {logged_value}")
+            logger.info(f"Exporting `{var_name}` to ray runtime env")
             env_vars[var_name] = value
 
     # Forward any SKYRL_* overrides set in the launching shell (e.g.
@@ -1269,10 +1270,10 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "VLLM_USE_DEEP_GEMM_E8M0",
     ):
         if value := os.environ.get(var_name, fp8_env_defaults.get(var_name)):
-            logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
+            logger.info(f"Exporting `{var_name}` to ray runtime env")
             env_vars[var_name] = value
 
-    return env_vars
+    return environment_policy.filter(env_vars)
 
 
 def configure_ray_worker_logging() -> None:
@@ -1330,6 +1331,8 @@ def initialize_ray(cfg: SkyRLTrainConfig):
     """
     from skyrl.backends.skyrl_train.utils.ppo_utils import sync_registries
 
+    launch = owned_ray_launch(cfg)
+
     # When SKYRL_DUMP_INFRA_LOG_TO_STDOUT=1, show all logs on stdout (no file redirect)
     verbose_logging = SKYRL_DUMP_INFRA_LOG_TO_STDOUT
 
@@ -1351,7 +1354,7 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    ray.init(**launch.init_kwargs, runtime_env={"env_vars": env_vars}, log_to_driver=True)
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")
