@@ -55,6 +55,8 @@ def eval_entrypoint(cfg: SkyRLTrainConfig) -> dict:
 
 def main() -> None:
     cfg = SkyRLTrainConfig.from_cli_overrides(sys.argv[1:])
+    if cfg.generator.inference_engine.dynamo is not None:
+        raise ValueError("Dynamo inference is unsupported by the evaluation-only entrypoint")
     validate_generator_cfg(cfg)
     initialize_ray(cfg)
     metrics = ray.get(eval_entrypoint.remote(cfg))

@@ -247,6 +247,14 @@ def test_environment_logs_only_names_and_preserves_forwarded_values(monkeypatch)
     assert any("NCCL_DEBUG" in message for message in messages)
 
 
+@pytest.mark.parametrize("colocate_all", [False, True])
+def test_unknown_transport_does_not_fall_back_to_nccl(colocate_all):
+    from skyrl.backends.skyrl_train.weight_sync import get_transfer_strategy
+
+    with pytest.raises(ValueError, match="Unsupported weight sync backend"):
+        get_transfer_strategy("nccl-typo", colocate_all)
+
+
 @pytest.mark.parametrize("secret", [None, "short", "x" * 32 + "\n", "x" * 32 + " ", "x" * 32 + "\x7f"])
 def test_runtime_environment_validates_dynamo_secret_before_platform_probes(monkeypatch, secret):
     cfg = configured()

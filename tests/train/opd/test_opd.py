@@ -337,6 +337,9 @@ def test_validate_opd_cfg_accepts_each_backend_with_its_own_fields():
             ["trainer.teacher.model=m", "trainer.teacher.backend=vllm", "trainer.teacher.server_url=http://a:8000"]
         )
     )
+    validate_opd_cfg(
+        OPDExpConfig.from_cli_overrides(["trainer.teacher.model=m", "trainer.teacher.inference_engine.dynamo=null"])
+    )
 
 
 @pytest.mark.parametrize(
@@ -375,6 +378,14 @@ def test_validate_opd_cfg_accepts_each_backend_with_its_own_fields():
         (
             ["trainer.teacher.model=m", "trainer.teacher.inference_engine.speculative_config={method: mtp}"],
             "speculative_config does not apply",
+        ),
+        (
+            ["trainer.teacher.model=m", "trainer.teacher.inference_engine.dynamo={}"],
+            "dynamo does not apply",
+        ),
+        (
+            ["trainer.teacher.model=m", "trainer.teacher.inference_engine.dynamo.namespace=teacher"],
+            "dynamo does not apply",
         ),
         (["trainer.teacher.model=m", "trainer.teacher.inference_engine.num_engines=0"], "at least one GPU"),
         (

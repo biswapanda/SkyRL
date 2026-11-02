@@ -1,3 +1,4 @@
+import asyncio
 import copy
 from argparse import Namespace
 from dataclasses import dataclass, field
@@ -272,6 +273,7 @@ def build_new_inference_client(
 ) -> Tuple[RemoteInferenceClient, InferenceServerSetup]:
     """Build the new HTTP-based inference client and supporting state for the policy.
 
+    Validate and prepare an external Dynamo policy, or call
     :func:`build_new_inference_client_impl` with the policy's engine block, model path and vLLM args,
     plus the policy-only client fields (tokenizer, capture, score centering, LoRA sync).
 
@@ -283,18 +285,47 @@ def build_new_inference_client(
     Returns:
         Tuple of (client, server_setup); see :func:`build_new_inference_client_impl`.
     """
+    from .dynamo.launch import validate_dynamo_config
+
+    validate_dynamo_config(cfg)
     ie_cfg = cfg.generator.inference_engine
+    client_kwargs = dict(
+        tokenizer=tokenizer,
+        enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
+        enable_return_sample_support_set=ie_cfg.enable_return_sample_support_set,
+        enable_return_sample_support_logprobs=cfg.trainer.algorithm.enable_score_centering,
+        uses_lora_weight_sync=_uses_lora_weight_sync(cfg),
+    )
+    if ie_cfg.dynamo is not None:
+        from .dynamo.client import DynamoInferenceClient
+        from .dynamo.discovery import discover_worker_snapshot
+
+        model_name = ie_cfg.served_model_name or cfg.trainer.policy.model.path
+        snapshot = discover_worker_snapshot(ie_cfg.dynamo, model_name)
+        server_setup = InferenceServerSetup(
+            proxy_url=ie_cfg.external_proxy_url,
+            server_urls=[worker.system_url for worker in snapshot.workers],
+        )
+        client = DynamoInferenceClient(
+            cfg=ie_cfg.dynamo,
+            snapshot=snapshot,
+            transport=ie_cfg.weight_sync_backend,
+            proxy_url=server_setup.proxy_url,
+            server_urls=server_setup.server_urls,
+            model_name=model_name,
+            data_parallel_size=ie_cfg.data_parallel_size,
+            **client_kwargs,
+        )
+        asyncio.run(client.prepare_for_initialization())
+        return client, server_setup
+
     return build_new_inference_client_impl(
         ie_cfg,
         model_path=cfg.trainer.policy.model.path,
         log_path=cfg.trainer.log_path,
         make_cli_args=lambda: build_vllm_cli_args(cfg),
         placement_group=placement_group,
-        tokenizer=tokenizer,
-        enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
-        enable_return_sample_support_set=ie_cfg.enable_return_sample_support_set,
-        enable_return_sample_support_logprobs=cfg.trainer.algorithm.enable_score_centering,
-        uses_lora_weight_sync=_uses_lora_weight_sync(cfg),
+        **client_kwargs,
     )
 
 

@@ -2,7 +2,7 @@
 title: "Inference Architecture"
 ---
 
-This page explains how SkyRL's inference engine separates data and control planes, and how weight sync works during training. We detail the architecture of SkyRL's HTTP-based inference implementation below.
+This page explains how SkyRL's native direct-vLLM inference path separates data and control planes, and how weight sync works during training. The APIs and lifecycle examples below describe that native path, not the restricted external Dynamo profile.
 
 ## System Architecture
 
@@ -91,11 +91,11 @@ There are three `PauseMode` values:
 | `wait` | Scheduler waits for in-flight to finish; new requests queue | New requests resume after `/resume` |
 | `keep` | Scheduler **freezes in-flight requests in place**; KV cache is preserved; new requests queue | Frozen requests pick up exactly where they left off after `/resume` |
 
-During weight sync in non-colocated mode SkyRL calls `/pause?mode=keep`, runs the weight update, then `/resume`. Rollouts that were in flight are preserved in the scheduler and continue from the same token position with the new policy.
+During native weight sync in non-colocated mode SkyRL calls `/pause?mode=keep`, runs the weight update, then `/resume`. Rollouts that were in flight are preserved in the scheduler and continue from the same token position with the new policy.
 
 ## Weight Sync APIs
 
-SkyRL uses the native weight syncing APIs in vLLM, with the following four-stage protocol:
+Direct-vLLM deployments use the native weight syncing APIs in vLLM, with the following four-stage protocol:
 
 - `POST /init_weight_transfer_engine` — Establishes the communication channel between the trainer and inference workers.
 - `POST /start_weight_update` — Starts a weight update.
@@ -104,10 +104,10 @@ SkyRL uses the native weight syncing APIs in vLLM, with the following four-stage
 
 The trainer side runs on vLLM's *trainer-send* abstraction: each training worker builds a `WeightSource` over its live model and hands it to a `TrainerWeightTransferEngine`, whose `send_weights()` drives the whole four-stage round trip above. See `skyrl/backends/skyrl_train/weight_sync/weight_senders.py`.
 
-Four backends, selected by `generator.inference_engine.weight_sync_backend` plus `trainer.placement.colocate_all`:
+Four resolved backends are selected by `generator.inference_engine.weight_sync_backend` plus `trainer.placement.colocate_all`. Native colocated deployments configure `nccl`, which resolves to CUDA IPC. Explicit `weight_sync_backend=ipc` is reserved for the restricted external Dynamo profile, which validates matching physical GPU UUIDs despite non-colocated placement and uses its own control lifecycle, not the native sleep/wake flow below. Unknown backend names raise `ValueError` instead of falling back to NCCL.
 
 - **`nccl`** — non-colocated. Tensor data is broadcast over NCCL from trainer rank 0 to all inference workers, concurrently with the `/update_weights` HTTP call that ships the metadata (both sides rendezvous inside the same NCCL calls). Combined with `/pause?mode=keep` and `/resume` so in-flight rollouts pause correctly during the sync.
-- **`ipc`** — colocated, where the trainer and inference engines share GPUs. Weights are packed into one reusable buffer and exchanged via CUDA IPC handles. Combined with `/sleep` and `/wake_up` for memory management — the inference engine sleeps to free VRAM during training, then wakes for rollouts.
+- **`ipc`** — on the native path, the resolved transport for colocated training and inference sharing GPUs. Weights are packed into one reusable buffer and exchanged via CUDA IPC handles. Combined with `/sleep` and `/wake_up` for memory management — the inference engine sleeps to free VRAM during training, then wakes for rollouts.
 - **`delta`** — weights travel as compressed deltas against the base checkpoint through a shared filesystem or object store, for setups where the two sides are not NCCL-reachable.
 - **`sharded_rdt`** — the inference workers *pull* the slices they consume from the trainer ranks over NIXL/RDMA.
 
@@ -129,7 +129,7 @@ Endpoint summary:
 
 ## End-to-end Weight Sync Flow
 
-**Non-colocated mode (NCCL broadcast):**
+**Native non-colocated mode (NCCL broadcast):**
 
 ```
 trainer step done
@@ -148,7 +148,7 @@ client.resume()                  ──►  frozen requests thaw, continue
 rollouts proceed on new policy
 ```
 
-**Colocated mode (CUDA IPC):**
+**Native colocated mode (CUDA IPC):**
 
 ```
 trainer step done

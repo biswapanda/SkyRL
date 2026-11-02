@@ -2,6 +2,7 @@
 
 from argparse import Namespace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -19,7 +20,12 @@ from skyrl.backends.skyrl_train.inference_servers.setup import (
     build_new_inference_client_impl,
     create_inference_servers,
 )
-from skyrl.train.config import InferenceEngineConfig, SkyRLTrainConfig
+from skyrl.backends.skyrl_train.weight_sync import get_transfer_strategy
+from skyrl.train.config import (
+    DynamoInferenceConfig,
+    InferenceEngineConfig,
+    SkyRLTrainConfig,
+)
 
 
 class FakeServerGroup:
@@ -181,3 +187,40 @@ def test_build_new_inference_client_launched_and_external_clients_get_the_same_p
         "data_parallel_size",
     ):
         assert getattr(launched, name) == getattr(external, name), name
+
+
+@pytest.mark.parametrize("colocated,transport", [(False, "nccl"), (True, "ipc")])
+def test_policy_native_nccl_keeps_placement_selection(monkeypatch, colocated, transport):
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.placement.colocate_all = colocated
+    cfg.generator.inference_engine.weight_sync_backend = "nccl"
+    native = MagicMock(return_value=("native-client", "native-setup"))
+    monkeypatch.setattr(inference_setup, "build_new_inference_client_impl", native)
+
+    assert build_new_inference_client(cfg, tokenizer=None) == ("native-client", "native-setup")
+
+    assert native.call_args.args == (cfg.generator.inference_engine,)
+    assert get_transfer_strategy(cfg.generator.inference_engine.weight_sync_backend, colocated) == transport
+
+
+def test_frozen_teacher_does_not_enter_policy_dynamo_gate(monkeypatch):
+    from skyrl.backends.skyrl_train.inference_servers import utils
+    from skyrl.backends.skyrl_train.inference_servers.dynamo import discovery, launch
+    from skyrl.train.opd.teacher_launch import launch_teacher
+
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.dynamo = DynamoInferenceConfig(namespace="student")
+    cfg.generator.inference_engine.external_proxy_url = "http://student:9000"
+    teacher_engine = InferenceEngineConfig(external_proxy_url="http://teacher:9000")
+    cfg.trainer.teacher = SimpleNamespace(model="frozen-teacher", inference_engine=teacher_engine)
+    monkeypatch.setattr(launch, "validate_dynamo_config", lambda *a: pytest.fail("validated student policy"))
+    monkeypatch.setattr(discovery, "discover_worker_snapshot", lambda *a: pytest.fail("discovered student fleet"))
+    monkeypatch.setattr(utils, "build_frozen_vllm_cli_args", lambda *a: pytest.fail("built external teacher args"))
+
+    client, server_setup = launch_teacher(cfg)
+
+    assert type(client) is RemoteInferenceClient
+    assert client.model_name == "frozen-teacher"
+    assert client.proxy_url == server_setup.proxy_url == "http://teacher:9000"
+    assert client.tokenizer is None
+    assert client.uses_lora_weight_sync is False
